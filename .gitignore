@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Large datasets
+data/raw/*.csv
+data/raw/*.parquet
+data/raw/*.json
+
+# Generated Spark outputs
+output/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Logs
+logs/*.log
+logs/*.jsonl
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
