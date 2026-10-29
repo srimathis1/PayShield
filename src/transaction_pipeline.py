@@ -1,3 +1,4 @@
+import os
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
@@ -19,7 +20,9 @@ spark.sparkContext.setLogLevel("WARN")
 # 2. READ RAW DATA
 # =====================================================
 
-input_path = "data/raw/paysim dataset.csv"
+input_path = os.environ.get(
+    "PAYSHIELD_INPUT_PATH", "data/raw/paysim dataset.csv"
+)
 
 df = (
     spark.read
@@ -91,7 +94,8 @@ print(f"Invalid records: {invalid_count:,}")
 # 5. SAVE INVALID RECORDS TO QUARANTINE
 # =====================================================
 
-quarantine_path = (
+quarantine_path = os.environ.get(
+    "PAYSHIELD_QUARANTINE_PATH",
     "output/quarantine_transactions"
 )
 
@@ -207,7 +211,10 @@ amount_analytics.show(truncate=False)
 # 8. SAVE CURATED DATA AS PARQUET
 # =====================================================
 
-output_path = "output/curated_transactions"
+output_path = os.environ.get(
+    "PAYSHIELD_OUTPUT_PATH",
+    "output/curated_transactions"
+)
 
 (
     features_df.write
