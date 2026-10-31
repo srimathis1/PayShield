@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import subprocess
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -16,23 +15,14 @@ import streamlit as st
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = PROJECT_ROOT / "data" / "raw" / "paysim dataset.csv"
-ETL_SCRIPT = PROJECT_ROOT / "src" / "transaction_pipeline.py"
 PREDICTION_SCRIPT = PROJECT_ROOT / "src" / "predict_transaction.py"
 CURATED_PATH = PROJECT_ROOT / "output" / "curated_transactions"
-QUARANTINE_PATH = PROJECT_ROOT / "output" / "quarantine_transactions"
 ML_PATH = PROJECT_ROOT / "output" / "ml"
 MODEL_PATH = ML_PATH / "random_forest_model"
 METRICS_PATH = ML_PATH / "metrics.json"
 LOG_PATH = PROJECT_ROOT / "logs"
 HISTORY_PATH = LOG_PATH / "pipeline_history.csv"
 
-SPARK_HOME = Path(
-    os.environ.get(
-        "SPARK_HOME",
-        str(Path.home() / "Downloads" / "spark-4.0.0-bin-hadoop3"),
-    )
-)
-SPARK_SUBMIT = SPARK_HOME / "bin" / "spark-submit"
 
 LOG_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -203,59 +193,12 @@ def append_history(status, duration, message):
 
 def spark_environment():
     env = os.environ.copy()
+    # PayShield uses local files. Prevent inherited HDFS/YARN config from
+    # accidentally redirecting local paths to HDFS.
     env.pop("HADOOP_CONF_DIR", None)
     env.pop("YARN_CONF_DIR", None)
     return env
 
-
-def run_etl():
-    if not DATA_PATH.exists():
-        st.error(f"Input dataset not found: {DATA_PATH}")
-        return
-    if not ETL_SCRIPT.exists():
-        st.error(f"ETL script not found: {ETL_SCRIPT}")
-        return
-    if not SPARK_SUBMIT.exists():
-        st.error(f"spark-submit not found: {SPARK_SUBMIT}")
-        return
-
-    env = spark_environment()
-    env["PAYSHIELD_INPUT_PATH"] = str(DATA_PATH)
-    env["PAYSHIELD_QUARANTINE_PATH"] = str(QUARANTINE_PATH)
-    env["PAYSHIELD_OUTPUT_PATH"] = str(CURATED_PATH)
-
-    log_file = LOG_PATH / f"pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
-    started = time.time()
-    try:
-        with st.spinner("Running Spark ETL. This may take several minutes..."):
-            with log_file.open("w", encoding="utf-8") as log_handle:
-                completed = subprocess.run(
-                    [str(SPARK_SUBMIT), str(ETL_SCRIPT)],
-                    cwd=str(PROJECT_ROOT),
-                    env=env,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=3600,
-                    check=False,
-                )
-        duration = time.time() - started
-        if completed.returncode == 0:
-            append_history("SUCCESS", duration, f"Log: {log_file.name}")
-            st.success(f"ETL completed in {duration:.1f} seconds.")
-        else:
-            append_history("FAILED", duration, f"Exit code {completed.returncode}")
-            st.error(f"ETL failed (exit code {completed.returncode}). See log below.")
-        with st.expander("Latest ETL log", expanded=completed.returncode != 0):
-            st.code(log_file.read_text(encoding="utf-8", errors="replace")[-12000:])
-    except subprocess.TimeoutExpired:
-        duration = time.time() - started
-        append_history("TIMEOUT", duration, "Exceeded 1-hour timeout")
-        st.error("ETL exceeded the one-hour timeout.")
-    except Exception as exc:
-        duration = time.time() - started
-        append_history("ERROR", duration, str(exc))
-        st.error(f"Could not run ETL: {exc}")
 
 
 def run_prediction(transaction):
@@ -280,6 +223,8 @@ def run_prediction(transaction):
     except Exception as exc:
         return None, f"Could not start prediction process: {exc}"
 
+    # The prediction script emits one JSON object, while Spark may emit
+    # startup/log messages around it. Search stdout from the end.
     for line in reversed(completed.stdout.splitlines()):
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
@@ -293,6 +238,7 @@ def run_prediction(transaction):
 
     details = (completed.stderr or completed.stdout or "No output returned.")[-5000:]
     return None, f"Prediction did not return valid JSON.\n{details}"
+
 
 # ============================================================
 # SIDEBAR
@@ -315,19 +261,16 @@ with st.sidebar:
         [
             "Overview",
             "Data Ingestion",
-            "Pipeline Execution",
             "Transaction Explorer",
             "Fraud Prediction",
             "Run History",
-            "AWS Architecture",
         ],
         label_visibility="visible",
     )
     st.divider()
     st.markdown("**Environment**")
-    st.caption("Engine · Apache Spark")
-    st.caption("Storage · Parquet")
-    st.caption("Mode · Local")
+    st.caption("Inference · Saved Spark MLlib model")
+    st.caption("Mode · Local prediction service")
     st.divider()
     st.caption("Portfolio demonstration · Not a production fraud system")
 
@@ -353,23 +296,18 @@ if page == "Overview":
 
     a, b, c, d = st.columns(4)
     a.metric("Raw dataset", "Available" if DATA_PATH.exists() else "Missing")
-    b.metric(
-        "CSV size",
-        f"{dataset_bytes / (1024**2):.1f} MB" if dataset_bytes else "—",
-    )
+    b.metric("CSV size", f"{dataset_bytes / (1024**2):.1f} MB" if dataset_bytes else "—")
     c.metric("Curated Parquet parts", f"{curated_parts:,}")
     d.metric("Saved ML model", "Available" if MODEL_PATH.exists() else "Missing")
 
     st.subheader("Pipeline at a glance")
     stages = st.columns(4)
-
     stage_info = [
         ("01", "Ingest", "Read the PaySim CSV"),
         ("02", "Validate", "Check required fields and records"),
-        ("03", "Curate", "Write partitioned Parquet data"),
+        ("03", "Store", "Use the completed curated dataset"),
         ("04", "Score", "Apply saved Spark MLlib model"),
     ]
-
     for column, (number, title, description) in zip(stages, stage_info):
         with column:
             st.markdown(f"### {number} · {title}")
@@ -378,15 +316,10 @@ if page == "Overview":
     if metrics:
         st.subheader("Saved model evaluation")
         x, y, z = st.columns(3)
-
         x.metric("ROC-AUC", f"{metrics.get('area_under_roc', 0):.4f}")
         y.metric("PR-AUC", f"{metrics.get('area_under_pr', 0):.4f}")
         z.metric("Test records", f"{int(metrics.get('test_records', 0)):,}")
-
-    st.info(
-        "Use **Fraud Prediction** to score an entered transaction "
-        "with the saved model."
-    )
+    st.info("Use **Fraud Prediction** to score an entered transaction with the saved model.")
 
 
 # ============================================================
@@ -394,115 +327,31 @@ if page == "Overview":
 # ============================================================
 elif page == "Data Ingestion":
     st.title("Data Ingestion")
-    st.write(
-        "Inspect a sample of the raw PaySim CSV. "
-        "The full file is not loaded into dashboard memory."
-    )
+    st.write("Inspect a sample of the raw PaySim CSV. The full file is not loaded into dashboard memory.")
     st.code(str(DATA_PATH))
 
     if not DATA_PATH.exists():
         st.error("CSV not found. Check the path above.")
     else:
         st.success("Raw dataset found.")
-
-        sample_rows = st.selectbox(
-            "Sample size",
-            [1000, 10000, 50000, 100000],
-            index=2,
-        )
-
+        sample_rows = st.selectbox("Sample size", [1000, 10000, 50000, 100000], index=2)
         data = load_csv_sample(DATA_PATH, rows=int(sample_rows))
-
         if data is not None:
             a, b, c = st.columns(3)
-
             a.metric("Rows sampled", f"{len(data):,}")
             b.metric("Columns", f"{len(data.columns):,}")
-            c.metric(
-                "Missing cells in sample",
-                f"{int(data.isna().sum().sum()):,}",
-            )
-
+            c.metric("Missing cells in sample", f"{int(data.isna().sum().sum()):,}")
             with st.expander("Column schema", expanded=True):
                 schema = pd.DataFrame({
                     "Column": data.columns,
                     "Type": [str(data[col].dtype) for col in data.columns],
-                    "Missing": [
-                        int(data[col].isna().sum())
-                        for col in data.columns
-                    ],
+                    "Missing": [int(data[col].isna().sum()) for col in data.columns],
                 })
-
-                st.dataframe(
-                    schema,
-                    hide_index=True,
-                    width="stretch",
-                )
-
+                st.dataframe(schema, hide_index=True, width="stretch")
             st.subheader("Sample records")
+            st.dataframe(data.head(100), hide_index=True, width="stretch")
+            st.caption("Counts shown on this page describe the selected sample, not the full dataset.")
 
-            st.dataframe(
-                data.head(100),
-                hide_index=True,
-                width="stretch",
-            )
-
-            st.caption(
-                "Counts shown on this page describe the selected sample, "
-                "not the full dataset."
-            )
-
-
-# ============================================================
-# PIPELINE EXECUTION
-# ============================================================
-elif page == "Pipeline Execution":
-    st.title("Pipeline Execution")
-    st.write(
-        "Run the existing local Spark ETL script. "
-        "This may take several minutes."
-    )
-
-    left, right = st.columns(2)
-
-    with left:
-        st.markdown("**Input CSV**")
-        st.code(str(DATA_PATH))
-
-        st.markdown("**ETL script**")
-        st.code(str(ETL_SCRIPT))
-
-    with right:
-        st.markdown("**Curated output**")
-        st.code(str(CURATED_PATH))
-
-        st.markdown("**Spark submit**")
-        st.code(str(SPARK_SUBMIT))
-
-    if st.button(
-        "Run PySpark ETL",
-        type="primary",
-        width="stretch",
-    ):
-        run_etl()
-
-    st.divider()
-
-    a, b = st.columns(2)
-
-    a.metric(
-        "Curated Parquet files",
-        f"{count_parquet_files(CURATED_PATH):,}",
-    )
-
-    b.metric(
-        "Quarantine output exists",
-        "Yes" if QUARANTINE_PATH.exists() else "No",
-    )
-
-    st.caption(
-        "This button runs ETL only; it does not retrain the fraud model."
-    )
 
 
 # ============================================================
@@ -513,83 +362,318 @@ elif page == "Transaction Explorer":
     st.write("Explore and filter a bounded sample of the raw CSV.")
 
     data = load_csv_sample(DATA_PATH, rows=100_000)
-
     if data is None:
         st.warning("Raw CSV not found or could not be read.")
-
     else:
         filtered = data.copy()
-
         c1, c2, c3 = st.columns(3)
 
         if "type" in filtered:
-            types = sorted(
-                filtered["type"].dropna().unique().tolist()
-            )
-
+            types = sorted(filtered["type"].dropna().unique().tolist())
             with c1:
-                selected_types = st.multiselect(
-                    "Transaction type",
-                    types,
-                    default=types,
-                )
-
-            filtered = filtered[
-                filtered["type"].isin(selected_types)
-            ]
+                selected_types = st.multiselect("Transaction type", types, default=types)
+            filtered = filtered[filtered["type"].isin(selected_types)]
 
         if "amount" in filtered:
             lo = float(filtered["amount"].min())
             hi = float(filtered["amount"].max())
-
             if lo < hi:
                 with c2:
-                    amount_range = st.slider(
-                        "Amount range",
-                        min_value=lo,
-                        max_value=hi,
-                        value=(lo, hi),
-                    )
-
-                filtered = filtered[
-                    filtered["amount"].between(*amount_range)
-                ]
+                    amount_range = st.slider("Amount range", min_value=lo, max_value=hi, value=(lo, hi))
+                filtered = filtered[filtered["amount"].between(*amount_range)]
 
         if "isFraud" in filtered:
             with c3:
-                label_filter = st.selectbox(
-                    "Label",
-                    ["All", "Fraud only", "Non-fraud only"],
-                )
-
+                label_filter = st.selectbox("Label", ["All", "Fraud only", "Non-fraud only"])
             if label_filter == "Fraud only":
-                filtered = filtered[
-                    filtered["isFraud"] == 1
-                ]
-
+                filtered = filtered[filtered["isFraud"] == 1]
             elif label_filter == "Non-fraud only":
-                filtered = filtered[
-                    filtered["isFraud"] == 0
-                ]
+                filtered = filtered[filtered["isFraud"] == 0]
 
         a, b = st.columns(2)
-
         a.metric("Rows in loaded sample", f"{len(data):,}")
         b.metric("Rows after filters", f"{len(filtered):,}")
-
-        st.dataframe(
-            filtered.head(500),
-            hide_index=True,
-            width="stretch",
-        )
-
+        st.dataframe(filtered.head(500), hide_index=True, width="stretch")
         st.download_button(
             "Download filtered rows",
             data=filtered.to_csv(index=False).encode("utf-8"),
             file_name="payshield_filtered_sample.csv",
             mime="text/csv",
         )
+        st.caption("Filters apply to the first 100,000 CSV rows only.")
 
-        st.caption(
-            "Filters apply to the first 100,000 CSV rows only."
+
+# ============================================================
+# FRAUD PREDICTION
+# ============================================================
+elif page == "Fraud Prediction":
+    st.title("Transaction Risk Scoring")
+    st.write("Enter a transaction to obtain a score from the persisted Spark MLlib pipeline.")
+    st.info(
+        "Each submission invokes the saved model. This is a model-based risk estimate, "
+        "not proof of fraud. The first request can take time while Spark starts."
+    )
+
+    if not MODEL_PATH.exists():
+        st.error(f"Saved model directory is missing: {MODEL_PATH}")
+        st.stop()
+    if not PREDICTION_SCRIPT.exists():
+        st.error(f"Prediction script is missing: {PREDICTION_SCRIPT}")
+        st.stop()
+
+    with st.form("predict_transaction_form", clear_on_submit=False):
+        st.subheader("Transaction features")
+        left, right = st.columns(2)
+        with left:
+            tx_type = st.selectbox("Transaction type", ["TRANSFER", "CASH_OUT", "CASH_IN", "PAYMENT", "DEBIT"])
+            amount = st.number_input("Amount", min_value=0.0, value=25000.0, step=100.0, format="%.2f")
+            origin_before = st.number_input("Origin balance before", min_value=0.0, value=30000.0, step=100.0, format="%.2f")
+            origin_after = st.number_input("Origin balance after", min_value=0.0, value=5000.0, step=100.0, format="%.2f")
+        with right:
+            destination_before = st.number_input("Destination balance before", min_value=0.0, value=10000.0, step=100.0, format="%.2f")
+            destination_after = st.number_input("Destination balance after", min_value=0.0, value=35000.0, step=100.0, format="%.2f")
+            threshold_pct = st.slider("Flag for review at probability", min_value=1, max_value=99, value=50, format="%d%%")
+
+        submitted = st.form_submit_button("Score transaction", type="primary", width="stretch")
+
+    if submitted:
+        tx = {
+            "type": tx_type,
+            "amount": amount,
+            "oldbalanceOrg": origin_before,
+            "newbalanceOrig": origin_after,
+            "oldbalanceDest": destination_before,
+            "newbalanceDest": destination_after,
+        }
+
+        with st.spinner("Loading saved model and scoring transaction..."):
+            prediction, error = run_prediction(tx)
+
+        if error:
+            st.error("Prediction failed — the model did not return a valid result.")
+            st.markdown("**Debug details**")
+            st.code(error)
+            st.caption(
+                "No prediction has been fabricated. Check that the saved Spark "
+                "PipelineModel is readable and that local Spark can start."
+            )
+        else:
+            probability = float(prediction["fraud_probability"])
+            model_class = int(prediction.get("model_prediction", 0))
+            diagnostics = prediction.get("balance_diagnostics", {})
+            sender_mismatch = bool(diagnostics.get("sender_balance_mismatch", False))
+            receiver_mismatch = bool(diagnostics.get("receiver_balance_mismatch", False))
+            balance_mismatch = bool(
+                diagnostics.get(
+                    "any_balance_mismatch",
+                    sender_mismatch or receiver_mismatch,
+                )
+            )
+
+            if not 0.0 <= probability <= 1.0:
+                st.error(f"Model returned invalid probability: {probability}")
+            else:
+                threshold = threshold_pct / 100.0
+                threshold_flag = probability >= threshold
+                model_flag = model_class == 1
+                requires_review = model_flag or threshold_flag or balance_mismatch
+
+                if (model_flag or threshold_flag) and balance_mismatch:
+                    risk_level = "HIGH"
+                    risk_status = "MODEL_ALERT_AND_BALANCE_MISMATCH"
+                    recommendation = "Prioritize this transaction for human review."
+                elif model_flag:
+                    risk_level = "HIGH"
+                    risk_status = "ML_FRAUD_ALERT"
+                    recommendation = "The classifier flagged this transaction; investigate it."
+                elif threshold_flag:
+                    risk_level = "HIGH"
+                    risk_status = "PROBABILITY_THRESHOLD_EXCEEDED"
+                    recommendation = "Fraud probability meets the selected review threshold."
+                elif balance_mismatch:
+                    risk_level = "REVIEW"
+                    risk_status = "BALANCE_MISMATCH"
+                    recommendation = (
+                        "Investigate the balance inconsistency even though the model "
+                        "did not flag fraud."
+                    )
+                else:
+                    risk_level = "LOW"
+                    risk_status = "NO_RULE_ALERT"
+                    recommendation = (
+                        "No configured alert was triggered. This does not guarantee "
+                        "that the transaction is legitimate."
+                    )
+
+                st.subheader("Risk assessment")
+                risk_col, status_col, review_col = st.columns(3)
+                risk_col.metric("Combined risk level", risk_level)
+                status_col.metric("Risk status", risk_status.replace("_", " ").title())
+                review_col.metric("Human review required", "YES" if requires_review else "NO")
+                if risk_level == "HIGH":
+                    st.error(f"HIGH RISK — {recommendation}")
+                elif risk_level == "REVIEW":
+                    st.warning(f"REVIEW REQUIRED — {recommendation}")
+                else:
+                    st.success(f"LOW ALERT LEVEL — {recommendation}")
+
+                st.subheader("Model output")
+                a, b, c = st.columns(3)
+                a.metric("Fraud probability", f"{probability:.2%}")
+                b.metric("Selected review threshold", f"{threshold:.0%}")
+                c.metric(
+                    "Threshold decision",
+                    "Flag for review" if threshold_flag else "Below threshold",
+                )
+                st.progress(probability, text="Model-estimated fraud probability")
+                st.write(
+                    f"**Random Forest class:** "
+                    f"{'Fraud-like (1)' if model_flag else 'Not flagged (0)'}"
+                )
+                st.caption(
+                    "The classifier's class, probability-threshold rule, and balance "
+                    "checks are separate signals. A review alert is not proof of fraud."
+                )
+
+                st.subheader("Balance consistency checks")
+                if balance_mismatch:
+                    st.warning(
+                        "At least one balance mismatch was detected. Review the "
+                        "transaction; the mismatch alone does not establish fraud."
+                    )
+                else:
+                    st.success("No balance mismatch detected by these checks.")
+
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.metric(
+                        "Sender balance difference",
+                        f"{float(diagnostics.get('sender_balance_difference', 0)):,.2f}",
+                        help="Old sender balance minus amount minus new sender balance. A non-zero value indicates an inconsistency.",
+                    )
+                    st.caption(f"Mismatch detected: {'Yes' if sender_mismatch else 'No'}")
+                with d2:
+                    st.metric(
+                        "Receiver balance difference",
+                        f"{float(diagnostics.get('receiver_balance_difference', 0)):,.2f}",
+                        help="Old receiver balance plus amount minus new receiver balance. A non-zero value indicates an inconsistency.",
+                    )
+                    st.caption(f"Mismatch detected: {'Yes' if receiver_mismatch else 'No'}")
+
+                st.subheader("Submitted transaction")
+                feature_df = pd.DataFrame(
+                    [{
+                        "Feature": name,
+                        "Value": str(value),
+                    } for name, value in tx.items()]
+                )
+                st.dataframe(feature_df, hide_index=True, width="stretch")
+
+                st.download_button(
+                    "Download prediction report (JSON)",
+                    data=json.dumps({
+                        "transaction": tx,
+                        "model_prediction": model_class,
+                        "fraud_probability": probability,
+                        "threshold": threshold,
+                        "risk_assessment": {
+                            "risk_level": risk_level,
+                            "risk_status": risk_status,
+                            "requires_review": requires_review,
+                            "recommendation": recommendation,
+                        },
+                        "balance_diagnostics": diagnostics,
+                    }, indent=2).encode("utf-8"),
+                    file_name="payshield_prediction_report.json",
+                    mime="application/json",
+                )
+
+    st.divider()
+    st.subheader("Offline model evaluation")
+    metrics = load_metrics()
+    if metrics:
+        a, b, c = st.columns(3)
+        a.metric("ROC-AUC", f"{float(metrics.get('area_under_roc', 0)):.4f}")
+        b.metric("PR-AUC", f"{float(metrics.get('area_under_pr', 0)):.4f}")
+        c.metric(
+            "Test records",
+            f"{int(metrics.get('test_records', 0)):,}",
         )
+        st.caption("These are saved test-set metrics, separate from the individual prediction above.")
+
+        threshold_rows = metrics.get("threshold_analysis", [])
+        if threshold_rows:
+            threshold_df = pd.DataFrame(threshold_rows)
+            needed = {"threshold", "precision", "recall", "f1"}
+            if needed.issubset(threshold_df.columns):
+                st.subheader("Threshold comparison (exploratory)")
+                st.warning(
+                    "These threshold values were calculated on the test set. "
+                    "For final reporting, choose a threshold using validation data "
+                    "and evaluate once on an untouched test set."
+                )
+                chart_df = threshold_df.melt(
+                    id_vars="threshold",
+                    value_vars=["precision", "recall", "f1"],
+                    var_name="Metric",
+                    value_name="Score (%)",
+                )
+                chart = alt.Chart(chart_df).mark_line(point=True).encode(
+                    x=alt.X("threshold:Q", title="Threshold", axis=alt.Axis(format="%")),
+                    y=alt.Y("Score (%):Q", title="Score (%)", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color("Metric:N", title="Metric"),
+                    tooltip=[
+                        alt.Tooltip("threshold:Q", format=".0%"),
+                        "Metric:N",
+                        alt.Tooltip("Score (%):Q", format=".2f"),
+                    ],
+                ).properties(height=300)
+                st.altair_chart(chart, width="stretch")
+    else:
+        st.caption("No metrics.json found; individual prediction can still work if the saved model exists.")
+
+
+# ============================================================
+# RUN HISTORY
+# ============================================================
+elif page == "Run History":
+    st.title("Pipeline Run History")
+    if not HISTORY_PATH.exists():
+        st.info("No dashboard-initiated pipeline runs have been recorded yet.")
+    else:
+        try:
+            history = pd.read_csv(HISTORY_PATH)
+            if history.empty:
+                st.info("Run history is empty.")
+            else:
+                a, b, c = st.columns(3)
+                a.metric("Total runs", f"{len(history):,}")
+                b.metric("Successful", f"{int((history['status'] == 'SUCCESS').sum()):,}")
+                c.metric("Other outcomes", f"{int((history['status'] != 'SUCCESS').sum()):,}")
+                st.dataframe(history.iloc[::-1], hide_index=True, width="stretch")
+                st.download_button(
+                    "Download run history",
+                    data=history.to_csv(index=False).encode("utf-8"),
+                    file_name="payshield_run_history.csv",
+                    mime="text/csv",
+                )
+        except Exception as exc:
+            st.error(f"Could not read run history: {exc}")
+
+    st.subheader("Pipeline logs")
+    logs = sorted(LOG_PATH.glob("pipeline_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if logs:
+        selected_log = st.selectbox("Choose log", logs, format_func=lambda p: p.name)
+        if selected_log:
+            st.code(selected_log.read_text(encoding="utf-8", errors="replace")[-12000:])
+    else:
+        st.caption("No pipeline logs found.")
+
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+st.divider()
+st.caption("PayShield · Apache Spark · PySpark · Spark MLlib · Streamlit | Portfolio demonstration")
+

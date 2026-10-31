@@ -11,7 +11,12 @@ data/raw/*.parquet
 data/raw/*.json
 
 # Generated Spark outputs
-output/
+# Ignore generated outputs except the trained model
+output/*
+!output/ml/
+output/ml/*
+!output/ml/random_forest_model/
+!output/ml/random_forest_model/**
 spark-warehouse/
 metastore_db/
 derby.log
