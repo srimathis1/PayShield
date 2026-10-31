@@ -293,3 +293,303 @@ def run_prediction(transaction):
 
     details = (completed.stderr or completed.stdout or "No output returned.")[-5000:]
     return None, f"Prediction did not return valid JSON.\n{details}"
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+with st.sidebar:
+    st.markdown(
+        """
+        <div style="padding:10px 0 18px">
+            <div style="font-size:1.8rem;font-weight:800">🛡️ PayShield</div>
+            <div style="font-size:.72rem;letter-spacing:.13em;color:#a9c3e8">
+                TRANSACTION INTELLIGENCE
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.divider()
+    page = st.radio(
+        "WORKSPACE",
+        [
+            "Overview",
+            "Data Ingestion",
+            "Pipeline Execution",
+            "Transaction Explorer",
+            "Fraud Prediction",
+            "Run History",
+            "AWS Architecture",
+        ],
+        label_visibility="visible",
+    )
+    st.divider()
+    st.markdown("**Environment**")
+    st.caption("Engine · Apache Spark")
+    st.caption("Storage · Parquet")
+    st.caption("Mode · Local")
+    st.divider()
+    st.caption("Portfolio demonstration · Not a production fraud system")
+
+
+# ============================================================
+# OVERVIEW
+# ============================================================
+if page == "Overview":
+    st.markdown(
+        """
+        <div class="hero">
+            <div class="eyebrow">Financial data engineering</div>
+            <h1>PayShield Transaction Intelligence</h1>
+            <p>Validate transaction data, build curated datasets, and explore model-based fraud risk.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    dataset_bytes = DATA_PATH.stat().st_size if DATA_PATH.exists() else None
+    curated_parts = count_parquet_files(CURATED_PATH)
+    metrics = load_metrics()
+
+    a, b, c, d = st.columns(4)
+    a.metric("Raw dataset", "Available" if DATA_PATH.exists() else "Missing")
+    b.metric(
+        "CSV size",
+        f"{dataset_bytes / (1024**2):.1f} MB" if dataset_bytes else "—",
+    )
+    c.metric("Curated Parquet parts", f"{curated_parts:,}")
+    d.metric("Saved ML model", "Available" if MODEL_PATH.exists() else "Missing")
+
+    st.subheader("Pipeline at a glance")
+    stages = st.columns(4)
+
+    stage_info = [
+        ("01", "Ingest", "Read the PaySim CSV"),
+        ("02", "Validate", "Check required fields and records"),
+        ("03", "Curate", "Write partitioned Parquet data"),
+        ("04", "Score", "Apply saved Spark MLlib model"),
+    ]
+
+    for column, (number, title, description) in zip(stages, stage_info):
+        with column:
+            st.markdown(f"### {number} · {title}")
+            st.write(description)
+
+    if metrics:
+        st.subheader("Saved model evaluation")
+        x, y, z = st.columns(3)
+
+        x.metric("ROC-AUC", f"{metrics.get('area_under_roc', 0):.4f}")
+        y.metric("PR-AUC", f"{metrics.get('area_under_pr', 0):.4f}")
+        z.metric("Test records", f"{int(metrics.get('test_records', 0)):,}")
+
+    st.info(
+        "Use **Fraud Prediction** to score an entered transaction "
+        "with the saved model."
+    )
+
+
+# ============================================================
+# DATA INGESTION
+# ============================================================
+elif page == "Data Ingestion":
+    st.title("Data Ingestion")
+    st.write(
+        "Inspect a sample of the raw PaySim CSV. "
+        "The full file is not loaded into dashboard memory."
+    )
+    st.code(str(DATA_PATH))
+
+    if not DATA_PATH.exists():
+        st.error("CSV not found. Check the path above.")
+    else:
+        st.success("Raw dataset found.")
+
+        sample_rows = st.selectbox(
+            "Sample size",
+            [1000, 10000, 50000, 100000],
+            index=2,
+        )
+
+        data = load_csv_sample(DATA_PATH, rows=int(sample_rows))
+
+        if data is not None:
+            a, b, c = st.columns(3)
+
+            a.metric("Rows sampled", f"{len(data):,}")
+            b.metric("Columns", f"{len(data.columns):,}")
+            c.metric(
+                "Missing cells in sample",
+                f"{int(data.isna().sum().sum()):,}",
+            )
+
+            with st.expander("Column schema", expanded=True):
+                schema = pd.DataFrame({
+                    "Column": data.columns,
+                    "Type": [str(data[col].dtype) for col in data.columns],
+                    "Missing": [
+                        int(data[col].isna().sum())
+                        for col in data.columns
+                    ],
+                })
+
+                st.dataframe(
+                    schema,
+                    hide_index=True,
+                    width="stretch",
+                )
+
+            st.subheader("Sample records")
+
+            st.dataframe(
+                data.head(100),
+                hide_index=True,
+                width="stretch",
+            )
+
+            st.caption(
+                "Counts shown on this page describe the selected sample, "
+                "not the full dataset."
+            )
+
+
+# ============================================================
+# PIPELINE EXECUTION
+# ============================================================
+elif page == "Pipeline Execution":
+    st.title("Pipeline Execution")
+    st.write(
+        "Run the existing local Spark ETL script. "
+        "This may take several minutes."
+    )
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("**Input CSV**")
+        st.code(str(DATA_PATH))
+
+        st.markdown("**ETL script**")
+        st.code(str(ETL_SCRIPT))
+
+    with right:
+        st.markdown("**Curated output**")
+        st.code(str(CURATED_PATH))
+
+        st.markdown("**Spark submit**")
+        st.code(str(SPARK_SUBMIT))
+
+    if st.button(
+        "Run PySpark ETL",
+        type="primary",
+        width="stretch",
+    ):
+        run_etl()
+
+    st.divider()
+
+    a, b = st.columns(2)
+
+    a.metric(
+        "Curated Parquet files",
+        f"{count_parquet_files(CURATED_PATH):,}",
+    )
+
+    b.metric(
+        "Quarantine output exists",
+        "Yes" if QUARANTINE_PATH.exists() else "No",
+    )
+
+    st.caption(
+        "This button runs ETL only; it does not retrain the fraud model."
+    )
+
+
+# ============================================================
+# TRANSACTION EXPLORER
+# ============================================================
+elif page == "Transaction Explorer":
+    st.title("Transaction Explorer")
+    st.write("Explore and filter a bounded sample of the raw CSV.")
+
+    data = load_csv_sample(DATA_PATH, rows=100_000)
+
+    if data is None:
+        st.warning("Raw CSV not found or could not be read.")
+
+    else:
+        filtered = data.copy()
+
+        c1, c2, c3 = st.columns(3)
+
+        if "type" in filtered:
+            types = sorted(
+                filtered["type"].dropna().unique().tolist()
+            )
+
+            with c1:
+                selected_types = st.multiselect(
+                    "Transaction type",
+                    types,
+                    default=types,
+                )
+
+            filtered = filtered[
+                filtered["type"].isin(selected_types)
+            ]
+
+        if "amount" in filtered:
+            lo = float(filtered["amount"].min())
+            hi = float(filtered["amount"].max())
+
+            if lo < hi:
+                with c2:
+                    amount_range = st.slider(
+                        "Amount range",
+                        min_value=lo,
+                        max_value=hi,
+                        value=(lo, hi),
+                    )
+
+                filtered = filtered[
+                    filtered["amount"].between(*amount_range)
+                ]
+
+        if "isFraud" in filtered:
+            with c3:
+                label_filter = st.selectbox(
+                    "Label",
+                    ["All", "Fraud only", "Non-fraud only"],
+                )
+
+            if label_filter == "Fraud only":
+                filtered = filtered[
+                    filtered["isFraud"] == 1
+                ]
+
+            elif label_filter == "Non-fraud only":
+                filtered = filtered[
+                    filtered["isFraud"] == 0
+                ]
+
+        a, b = st.columns(2)
+
+        a.metric("Rows in loaded sample", f"{len(data):,}")
+        b.metric("Rows after filters", f"{len(filtered):,}")
+
+        st.dataframe(
+            filtered.head(500),
+            hide_index=True,
+            width="stretch",
+        )
+
+        st.download_button(
+            "Download filtered rows",
+            data=filtered.to_csv(index=False).encode("utf-8"),
+            file_name="payshield_filtered_sample.csv",
+            mime="text/csv",
+        )
+
+        st.caption(
+            "Filters apply to the first 100,000 CSV rows only."
+        )
