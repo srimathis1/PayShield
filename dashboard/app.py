@@ -1,440 +1,301 @@
 import json
 import os
-import sys
 import subprocess
-from datetime import datetime
+import sys
 from pathlib import Path
 
-import altair as alt
 import pandas as pd
 import streamlit as st
 
-
 # ============================================================
-# CONFIGURATION
+# PAYSHIELD — TRANSACTION INTELLIGENCE DASHBOARD
+# Uses the already-trained Spark MLlib model. No retraining.
 # ============================================================
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = PROJECT_ROOT / "data" / "raw" / "paysim dataset.csv"
-PREDICTION_SCRIPT = PROJECT_ROOT / "src" / "predict_transaction.py"
-CURATED_PATH = PROJECT_ROOT / "output" / "curated_transactions"
-ML_PATH = PROJECT_ROOT / "output" / "ml"
-MODEL_PATH = ML_PATH / "random_forest_model"
-METRICS_PATH = ML_PATH / "metrics.json"
-LOG_PATH = PROJECT_ROOT / "logs"
-HISTORY_PATH = LOG_PATH / "pipeline_history.csv"
 
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = ROOT / "output" / "ml" / "random_forest_model"
+PREDICT_SCRIPT = ROOT / "src" / "predict_transaction.py"
+METRICS_PATH = ROOT / "output" / "ml" / "metrics.json"
+RAW_DATA_PATH = ROOT / "data" / "raw" / "paysim dataset.csv"
 
-LOG_PATH.mkdir(parents=True, exist_ok=True)
+TOTAL_TRANSACTIONS = 6_362_620
+FRAUD_LABELLED = 8_213
+TRANSACTION_TYPES = ["TRANSFER", "CASH_OUT", "CASH_IN", "PAYMENT", "DEBIT"]
 
 st.set_page_config(
-    page_title="PayShield | Transaction Intelligence",
+    page_title="PayShield | Fraud Intelligence",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# ============================================================
-# STYLE
-# ============================================================
+# ---------------------------- Styling ----------------------------
 st.markdown(
     """
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
+
     :root {
-        --page: #f4f7fb;
-        --panel: #ffffff;
-        --ink: #17243b;
-        --muted: #62718a;
-        --line: #e0e7f0;
-        --blue: #2563eb;
-        --teal: #0f9f95;
+        --bg: #080f1d;
+        --panel: #101c2e;
+        --panel2: #14233a;
+        --border: rgba(148, 163, 184, .16);
+        --text: #edf4ff;
+        --muted: #91a4bd;
+        --cyan: #39d5d2;
+        --blue: #5b8cff;
     }
-    .stApp { background: var(--page); color: var(--ink); }
-    [data-testid="stHeader"] { background: rgba(244,247,251,.96); }
-    [data-testid="stSidebar"] {
-        background: #101c32;
-        border-right: 1px solid #263650;
-    }
-    [data-testid="stSidebar"] * { color: #e8eef8 !important; }
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
-        color: #bdcbe0 !important;
-    }
-    h1, h2, h3 { color: var(--ink); letter-spacing: -0.025em; }
-    h1 { font-size: 2.05rem !important; font-weight: 760 !important; }
-    h2 { font-size: 1.45rem !important; font-weight: 700 !important; }
-    h3 { font-size: 1.1rem !important; font-weight: 680 !important; }
+    html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+    .stApp { background: radial-gradient(ellipse at 75% 0%, #142b49 0%, #080f1d 48%); color: var(--text); }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stSidebar"] { background: #0b1627; border-right: 1px solid var(--border); }
+    [data-testid="stSidebar"] * { color: #dce8f8; }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #91a4bd; }
+    h1, h2, h3 { font-family: 'Space Grotesk', sans-serif !important; color: #f3f7ff !important; letter-spacing: -.035em; }
+    h1 { font-size: 2.25rem !important; }
+    h2 { font-size: 1.45rem !important; }
+    h3 { font-size: 1.08rem !important; }
+    p, label, .stMarkdown { color: #d6e2f2; }
     [data-testid="stMetric"] {
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 14px;
-        padding: 17px 18px;
-        box-shadow: 0 3px 12px rgba(20,40,80,.035);
-        min-width: 0;
+        background: linear-gradient(145deg, #14243a, #101b2d);
+        border: 1px solid var(--border); border-radius: 16px;
+        padding: 17px 19px; box-shadow: 0 10px 28px rgba(0,0,0,.12);
     }
-    [data-testid="stMetricLabel"] { color: var(--muted) !important; }
-    [data-testid="stMetricValue"] {
-        color: #175cd3 !important;
-        font-size: clamp(1.2rem, 2vw, 1.9rem) !important;
-        overflow-wrap: anywhere;
-    }
+    [data-testid="stMetricLabel"] { color: #9db0c9 !important; font-size: .82rem !important; }
+    [data-testid="stMetricValue"] { color: #f3f7ff !important; font-family: 'Space Grotesk', sans-serif; }
+    [data-testid="stMetricDelta"] { font-size: .78rem; }
     div.stButton > button, div.stFormSubmitButton > button {
-        border-radius: 10px;
-        min-height: 43px;
-        font-weight: 650;
+        border-radius: 10px; min-height: 44px; font-weight: 700;
+        border: 1px solid rgba(91,140,255,.45);
     }
-    div.stButton > button[kind="primary"],
-    div.stFormSubmitButton > button[kind="primary"] {
-        background: var(--blue);
-        border-color: var(--blue);
-        color: white;
-    }
-    [data-testid="stDataFrame"] {
-        border: 1px solid var(--line);
-        border-radius: 12px;
-        overflow: hidden;
-    }
-    [data-testid="stAlert"] { border-radius: 11px; }
-    hr { border-color: var(--line); }
-    .hero {
-        background: linear-gradient(120deg, #10264b 0%, #174ea6 65%, #0f9f95 130%);
-        padding: 27px 30px;
-        border-radius: 18px;
-        color: white;
-        margin-bottom: 22px;
-    }
-    .hero h1, .hero p, .hero span { color: white !important; }
-    .hero p { margin-bottom: 0; opacity: .88; }
-    .eyebrow {
-        font-size: .74rem; font-weight: 750; letter-spacing: .13em;
-        text-transform: uppercase; opacity: .85; margin-bottom: 9px;
-    }
-    .section-note { color: #62718a; font-size: .9rem; }
-    [data-testid="stWidgetLabel"] p,
-    [data-testid="stWidgetLabel"] label,
-    .stMarkdown p {
-        color: #24344d;
-    }
-    input, textarea {
-        color: #17243b !important;
-    }
-    [data-baseweb="select"] * {
-        color: #17243b;
+    div.stButton > button[kind="primary"], div.stFormSubmitButton > button[kind="primary"] {
+        background: linear-gradient(90deg, #3978f6, #20aaa9); color: white; border: 0;
     }
     div[data-testid="stForm"] {
-        background: #ffffff;
-        border: 1px solid #e0e7f0;
-        border-radius: 16px;
-        padding: 18px 20px 8px 20px;
+        background: #101c2e; border: 1px solid var(--border);
+        border-radius: 17px; padding: 20px 22px 10px;
     }
-    .result-good {
-        background: #e8f7ef; color: #146c43; padding: 16px 18px;
-        border: 1px solid #b8e5cb; border-radius: 12px; font-weight: 700;
+    [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 12px; }
+    [data-baseweb="select"] > div, [data-baseweb="input"] > div {
+        background: #14243a; border-color: #2b405d;
     }
-    .result-review {
-        background: #fff4e5; color: #9a4d00; padding: 16px 18px;
-        border: 1px solid #f5d09b; border-radius: 12px; font-weight: 700;
+    input, textarea { color: #edf4ff !important; }
+    [data-testid="stWidgetLabel"] p { color: #c3d2e6 !important; }
+    hr { border-color: var(--border); }
+    .hero {
+        padding: 30px 32px; border-radius: 21px; margin: 5px 0 23px;
+        background: linear-gradient(115deg, rgba(27,57,99,.96), rgba(17,112,123,.86));
+        border: 1px solid rgba(128,206,231,.22);
+        box-shadow: 0 18px 45px rgba(0,0,0,.18);
     }
+    .hero-kicker { color: #8ee8e4; font-size: .72rem; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+    .hero-title { color: white; font: 700 2.15rem 'Space Grotesk', sans-serif; margin: 9px 0 7px; }
+    .hero-copy { color: #d2e4f5; font-size: .98rem; max-width: 760px; margin: 0; }
+    .pill {
+        display: inline-block; padding: 6px 10px; border-radius: 99px;
+        background: rgba(57,213,210,.12); color: #73e6df;
+        border: 1px solid rgba(57,213,210,.25); font-size: .75rem; font-weight: 700;
+    }
+    .section-label { color: #7f9ab9; font-size: .72rem; font-weight: 800; letter-spacing: .15em; text-transform: uppercase; margin: 5px 0 9px; }
+    .info-card {
+        background: linear-gradient(145deg, #14243a, #101b2d);
+        border: 1px solid var(--border); border-radius: 15px;
+        padding: 18px 19px; min-height: 122px;
+    }
+    .info-number { color: #70deda; font: 700 1.45rem 'Space Grotesk', sans-serif; }
+    .info-title { color: #f0f5fc; font-weight: 700; margin: 7px 0 4px; }
+    .info-copy { color: #91a4bd; font-size: .83rem; line-height: 1.45; }
+    .risk-high { background: rgba(239,68,68,.12); border: 1px solid rgba(248,113,113,.4); color: #ff9b9b; padding: 15px 17px; border-radius: 12px; font-weight: 700; }
+    .risk-review { background: rgba(245,158,11,.12); border: 1px solid rgba(251,191,36,.4); color: #ffd17a; padding: 15px 17px; border-radius: 12px; font-weight: 700; }
+    .risk-low { background: rgba(34,197,94,.11); border: 1px solid rgba(74,222,128,.35); color: #8be6ad; padding: 15px 17px; border-radius: 12px; font-weight: 700; }
+    .small-muted { color: #91a4bd; font-size: .82rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-
-# ============================================================
-# HELPERS
-# ============================================================
+# ---------------------------- Helpers ----------------------------
+@st.cache_data(show_spinner=False)
 def load_metrics():
     if not METRICS_PATH.exists():
-        return None
+        return {}
     try:
-        with METRICS_PATH.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if not isinstance(data, dict):
-            raise ValueError("Metrics JSON must contain an object.")
-        return data
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        st.error(f"Could not read model metrics: {exc}")
-        return None
+        with METRICS_PATH.open("r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
-def load_csv_sample(path, rows=50_000):
-    if not path.exists():
-        return None
-    try:
-        return pd.read_csv(path, nrows=rows)
-    except Exception as exc:
-        st.error(f"Could not read {path.name}: {exc}")
-        return None
-
-
-def count_parquet_files(path):
-    if not path.exists():
-        return 0
-    return sum(1 for item in path.rglob("*.parquet") if item.is_file())
-
-
-def append_history(status, duration, message):
-    entry = pd.DataFrame([{
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "status": status,
-        "duration_seconds": round(float(duration), 2),
-        "message": str(message)[:500],
-    }])
-    try:
-        entry.to_csv(
-            HISTORY_PATH,
-            mode="a" if HISTORY_PATH.exists() else "w",
-            header=not HISTORY_PATH.exists(),
-            index=False,
-        )
-    except OSError as exc:
-        st.warning(f"Could not write run history: {exc}")
+@st.cache_data(show_spinner="Loading a sample of transactions...")
+def load_sample(rows=30000):
+    if not RAW_DATA_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_csv(RAW_DATA_PATH, nrows=rows)
 
 
 def spark_environment():
     env = os.environ.copy()
-    # PayShield uses local files. Prevent inherited HDFS/YARN config from
-    # accidentally redirecting local paths to HDFS.
     env.pop("HADOOP_CONF_DIR", None)
     env.pop("YARN_CONF_DIR", None)
     return env
 
 
-
-def run_prediction(transaction):
+def predict(transaction):
     if not MODEL_PATH.exists():
-        return None, f"Saved model not found: {MODEL_PATH}"
-    if not PREDICTION_SCRIPT.exists():
-        return None, f"Prediction script not found: {PREDICTION_SCRIPT}"
+        return None, f"Saved model directory is missing: {MODEL_PATH}"
+    if not PREDICT_SCRIPT.exists():
+        return None, f"Prediction script is missing: {PREDICT_SCRIPT}"
 
     try:
-        completed = subprocess.run(
-            [sys.executable, str(PREDICTION_SCRIPT)],
+        result = subprocess.run(
+            [sys.executable, str(PREDICT_SCRIPT)],
             input=json.dumps(transaction),
             text=True,
             capture_output=True,
-            cwd=str(PROJECT_ROOT),
+            cwd=str(ROOT),
             env=spark_environment(),
             timeout=240,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return None, "Prediction timed out while starting or running Spark."
+        return None, "Prediction timed out while Spark was starting or scoring."
     except Exception as exc:
         return None, f"Could not start prediction process: {exc}"
 
-    # The prediction script emits one JSON object, while Spark may emit
-    # startup/log messages around it. Search stdout from the end.
-    for line in reversed(completed.stdout.splitlines()):
+    for line in reversed(result.stdout.splitlines()):
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
             try:
                 payload = json.loads(line)
-                if completed.returncode != 0 or not payload.get("success"):
-                    return None, payload.get("error", completed.stderr[-4000:])
+                if result.returncode != 0 or not payload.get("success"):
+                    return None, payload.get("error", result.stderr[-4000:])
                 return payload, None
             except json.JSONDecodeError:
-                continue
+                pass
 
-    details = (completed.stderr or completed.stdout or "No output returned.")[-5000:]
+    details = (result.stderr or result.stdout or "No output returned.")[-5000:]
     return None, f"Prediction did not return valid JSON.\n{details}"
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+def money(value):
+    return f"₹{float(value):,.2f}"
+
+
+# ---------------------------- Sidebar ----------------------------
 with st.sidebar:
     st.markdown(
         """
-        <div style="padding:10px 0 18px">
-            <div style="font-size:1.8rem;font-weight:800">🛡️ PayShield</div>
-            <div style="font-size:.72rem;letter-spacing:.13em;color:#a9c3e8">
-                TRANSACTION INTELLIGENCE
-            </div>
+        <div style="padding:13px 4px 18px">
+          <div style="font:700 1.65rem 'Space Grotesk';color:#f5f8ff">🛡️ PayShield</div>
+          <div style="font-size:.68rem;letter-spacing:.17em;color:#6edbd7;font-weight:800">PAYMENT RISK INTELLIGENCE</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.divider()
     page = st.radio(
-        "WORKSPACE",
-        [
-            "Overview",
-            "Data Ingestion",
-            "Transaction Explorer",
-            "Fraud Prediction",
-            "Run History",
-        ],
+        "NAVIGATION",
+        ["Overview", "Fraud Prediction", "Transaction Explorer", "Model Insights"],
         label_visibility="visible",
     )
     st.divider()
-    st.markdown("**Environment**")
+    st.markdown("**SYSTEM STATUS**")
+    st.markdown(
+        f'<span class="pill">{"MODEL FILE FOUND" if MODEL_PATH.exists() else "MODEL FILE MISSING"}</span>',
+        unsafe_allow_html=True,
+    )
     st.caption("Inference · Saved Spark MLlib model")
-    st.caption("Mode · Local prediction service")
+    st.caption("Training · Not performed by this dashboard")
     st.divider()
-    st.caption("Portfolio demonstration · Not a production fraud system")
+    st.caption("PayShield is a portfolio screening demo, not a production fraud decision system.")
 
-
-# ============================================================
-# OVERVIEW
-# ============================================================
+# ---------------------------- Overview ----------------------------
 if page == "Overview":
     st.markdown(
         """
         <div class="hero">
-            <div class="eyebrow">Financial data engineering</div>
-            <h1>PayShield Transaction Intelligence</h1>
-            <p>Validate transaction data, build curated datasets, and explore model-based fraud risk.</p>
+          <div class="hero-kicker">Financial data engineering · Machine learning</div>
+          <div class="hero-title">See risk before it moves.</div>
+          <p class="hero-copy">PayShield combines transaction data quality checks, a curated PaySim dataset,
+          and a saved Random Forest model to surface transactions that may need closer review.</p>
+          <div style="margin-top:18px"><span class="pill">SPARK MLlib</span>&nbsp;&nbsp;<span class="pill">BATCH-TRAINED MODEL</span>&nbsp;&nbsp;<span class="pill">ON-DEMAND SCORING</span></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    dataset_bytes = DATA_PATH.stat().st_size if DATA_PATH.exists() else None
-    curated_parts = count_parquet_files(CURATED_PATH)
-    metrics = load_metrics()
+    st.markdown('<div class="section-label">Dataset snapshot</div>', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Transactions", f"{TOTAL_TRANSACTIONS:,}")
+    c2.metric("Fraud-labelled", f"{FRAUD_LABELLED:,}")
+    c3.metric("Fraud prevalence", f"{FRAUD_LABELLED / TOTAL_TRANSACTIONS:.3%}")
+    c4.metric("Saved model", "Available" if MODEL_PATH.exists() else "Not found")
 
-    a, b, c, d = st.columns(4)
-    a.metric("Raw dataset", "Available" if DATA_PATH.exists() else "Missing")
-    b.metric("CSV size", f"{dataset_bytes / (1024**2):.1f} MB" if dataset_bytes else "—")
-    c.metric("Curated Parquet parts", f"{curated_parts:,}")
-    d.metric("Saved ML model", "Available" if MODEL_PATH.exists() else "Missing")
-
-    st.subheader("Pipeline at a glance")
-    stages = st.columns(4)
-    stage_info = [
-        ("01", "Ingest", "Read the PaySim CSV"),
-        ("02", "Validate", "Check required fields and records"),
-        ("03", "Store", "Use the completed curated dataset"),
-        ("04", "Score", "Apply saved Spark MLlib model"),
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="section-label">How PayShield works</div>', unsafe_allow_html=True)
+    cols = st.columns(4)
+    cards = [
+        ("01", "INGEST", "PaySim transaction records are read from the raw CSV source."),
+        ("02", "VALIDATE", "Data quality rules check required fields and transaction values."),
+        ("03", "CURATE", "Validated records are stored in compressed Parquet format."),
+        ("04", "SCORE", "The persisted Random Forest pipeline estimates fraud probability."),
     ]
-    for column, (number, title, description) in zip(stages, stage_info):
-        with column:
-            st.markdown(f"### {number} · {title}")
-            st.write(description)
+    for col, (num, title, desc) in zip(cols, cards):
+        with col:
+            st.markdown(
+                f'<div class="info-card"><div class="info-number">{num}</div><div class="info-title">{title}</div><div class="info-copy">{desc}</div></div>',
+                unsafe_allow_html=True,
+            )
 
-    if metrics:
-        st.subheader("Saved model evaluation")
-        x, y, z = st.columns(3)
-        x.metric("ROC-AUC", f"{metrics.get('area_under_roc', 0):.4f}")
-        y.metric("PR-AUC", f"{metrics.get('area_under_pr', 0):.4f}")
-        z.metric("Test records", f"{int(metrics.get('test_records', 0)):,}")
-    st.info("Use **Fraud Prediction** to score an entered transaction with the saved model.")
-
-
-# ============================================================
-# DATA INGESTION
-# ============================================================
-elif page == "Data Ingestion":
-    st.title("Data Ingestion")
-    st.write("Inspect a sample of the raw PaySim CSV. The full file is not loaded into dashboard memory.")
-    st.code(str(DATA_PATH))
-
-    if not DATA_PATH.exists():
-        st.error("CSV not found. Check the path above.")
-    else:
-        st.success("Raw dataset found.")
-        sample_rows = st.selectbox("Sample size", [1000, 10000, 50000, 100000], index=2)
-        data = load_csv_sample(DATA_PATH, rows=int(sample_rows))
-        if data is not None:
-            a, b, c = st.columns(3)
-            a.metric("Rows sampled", f"{len(data):,}")
-            b.metric("Columns", f"{len(data.columns):,}")
-            c.metric("Missing cells in sample", f"{int(data.isna().sum().sum()):,}")
-            with st.expander("Column schema", expanded=True):
-                schema = pd.DataFrame({
-                    "Column": data.columns,
-                    "Type": [str(data[col].dtype) for col in data.columns],
-                    "Missing": [int(data[col].isna().sum()) for col in data.columns],
-                })
-                st.dataframe(schema, hide_index=True, width="stretch")
-            st.subheader("Sample records")
-            st.dataframe(data.head(100), hide_index=True, width="stretch")
-            st.caption("Counts shown on this page describe the selected sample, not the full dataset.")
-
-
-
-# ============================================================
-# TRANSACTION EXPLORER
-# ============================================================
-elif page == "Transaction Explorer":
-    st.title("Transaction Explorer")
-    st.write("Explore and filter a bounded sample of the raw CSV.")
-
-    data = load_csv_sample(DATA_PATH, rows=100_000)
-    if data is None:
-        st.warning("Raw CSV not found or could not be read.")
-    else:
-        filtered = data.copy()
-        c1, c2, c3 = st.columns(3)
-
-        if "type" in filtered:
-            types = sorted(filtered["type"].dropna().unique().tolist())
-            with c1:
-                selected_types = st.multiselect("Transaction type", types, default=types)
-            filtered = filtered[filtered["type"].isin(selected_types)]
-
-        if "amount" in filtered:
-            lo = float(filtered["amount"].min())
-            hi = float(filtered["amount"].max())
-            if lo < hi:
-                with c2:
-                    amount_range = st.slider("Amount range", min_value=lo, max_value=hi, value=(lo, hi))
-                filtered = filtered[filtered["amount"].between(*amount_range)]
-
-        if "isFraud" in filtered:
-            with c3:
-                label_filter = st.selectbox("Label", ["All", "Fraud only", "Non-fraud only"])
-            if label_filter == "Fraud only":
-                filtered = filtered[filtered["isFraud"] == 1]
-            elif label_filter == "Non-fraud only":
-                filtered = filtered[filtered["isFraud"] == 0]
-
-        a, b = st.columns(2)
-        a.metric("Rows in loaded sample", f"{len(data):,}")
-        b.metric("Rows after filters", f"{len(filtered):,}")
-        st.dataframe(filtered.head(500), hide_index=True, width="stretch")
-        st.download_button(
-            "Download filtered rows",
-            data=filtered.to_csv(index=False).encode("utf-8"),
-            file_name="payshield_filtered_sample.csv",
-            mime="text/csv",
+    st.markdown("<br>", unsafe_allow_html=True)
+    left, right = st.columns([1.2, 1])
+    with left:
+        st.markdown("### Risk signals")
+        st.write("PayShield keeps the model output and rule-based checks distinct:")
+        st.write("- **Model class:** whether the saved classifier flags the transaction.")
+        st.write("- **Fraud probability:** the model's estimated probability for the fraud class.")
+        st.write("- **Review threshold:** a user-selected probability threshold.")
+        st.write("- **Balance checks:** arithmetic consistency of sender and receiver balances.")
+    with right:
+        st.markdown("### Quick action")
+        st.markdown(
+            '<div class="info-card"><div class="info-title">Score a transaction</div>'
+            '<div class="info-copy">Enter transaction details and receive the saved model output, '
+            'balance diagnostics, and a review recommendation.</div></div>',
+            unsafe_allow_html=True,
         )
-        st.caption("Filters apply to the first 100,000 CSV rows only.")
 
+    st.caption("Dataset figures refer to the PaySim dataset used in this project. Risk alerts are screening signals, not proof of fraud.")
 
-# ============================================================
-# FRAUD PREDICTION
-# ============================================================
+# ---------------------------- Fraud Prediction ----------------------------
 elif page == "Fraud Prediction":
-    st.title("Transaction Risk Scoring")
-    st.write("Enter a transaction to obtain a score from the persisted Spark MLlib pipeline.")
-    st.info(
-        "Each submission invokes the saved model. This is a model-based risk estimate, "
-        "not proof of fraud. The first request can take time while Spark starts."
-    )
+    st.markdown('<div class="section-label">LIVE INFERENCE · SAVED MODEL</div>', unsafe_allow_html=True)
+    st.title("Fraud risk assessment")
+    st.write("Submit a transaction to score it with the persisted Spark MLlib Random Forest pipeline.")
+    st.info("The dashboard loads the existing model for inference only. It does not retrain the model. The first request may take longer while Spark starts.")
 
     if not MODEL_PATH.exists():
-        st.error(f"Saved model directory is missing: {MODEL_PATH}")
+        st.error(f"Saved model not found: {MODEL_PATH}")
         st.stop()
-    if not PREDICTION_SCRIPT.exists():
-        st.error(f"Prediction script is missing: {PREDICTION_SCRIPT}")
+    if not PREDICT_SCRIPT.exists():
+        st.error(f"Prediction script not found: {PREDICT_SCRIPT}")
         st.stop()
 
-    with st.form("predict_transaction_form", clear_on_submit=False):
-        st.subheader("Transaction features")
-        left, right = st.columns(2)
-        with left:
-            tx_type = st.selectbox("Transaction type", ["TRANSFER", "CASH_OUT", "CASH_IN", "PAYMENT", "DEBIT"])
-            amount = st.number_input("Amount", min_value=0.0, value=25000.0, step=100.0, format="%.2f")
-            origin_before = st.number_input("Origin balance before", min_value=0.0, value=30000.0, step=100.0, format="%.2f")
-            origin_after = st.number_input("Origin balance after", min_value=0.0, value=5000.0, step=100.0, format="%.2f")
-        with right:
-            destination_before = st.number_input("Destination balance before", min_value=0.0, value=10000.0, step=100.0, format="%.2f")
-            destination_after = st.number_input("Destination balance after", min_value=0.0, value=35000.0, step=100.0, format="%.2f")
-            threshold_pct = st.slider("Flag for review at probability", min_value=1, max_value=99, value=50, format="%d%%")
-
-        submitted = st.form_submit_button("Score transaction", type="primary", width="stretch")
+    with st.form("transaction_form"):
+        st.markdown("### Transaction details")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            tx_type = st.selectbox("Transaction type", TRANSACTION_TYPES, index=0)
+            amount = st.number_input("Transaction amount", min_value=0.0, value=25000.0, step=500.0)
+            origin_before = st.number_input("Sender balance before", min_value=0.0, value=30000.0, step=500.0)
+            origin_after = st.number_input("Sender balance after", min_value=0.0, value=5000.0, step=500.0)
+        with col_b:
+            destination_before = st.number_input("Receiver balance before", min_value=0.0, value=10000.0, step=500.0)
+            destination_after = st.number_input("Receiver balance after", min_value=0.0, value=35000.0, step=500.0)
+            threshold_pct = st.slider("Review threshold", min_value=1, max_value=99, value=20, format="%d%%")
+            st.caption("A lower threshold flags more transactions for review.")
+        submitted = st.form_submit_button("🛡️  Analyse transaction", type="primary", use_container_width=True)
 
     if submitted:
         tx = {
@@ -445,235 +306,155 @@ elif page == "Fraud Prediction":
             "oldbalanceDest": destination_before,
             "newbalanceDest": destination_after,
         }
-
-        with st.spinner("Loading saved model and scoring transaction..."):
-            prediction, error = run_prediction(tx)
+        with st.spinner("Starting Spark and scoring with the saved model..."):
+            output, error = predict(tx)
 
         if error:
-            st.error("Prediction failed — the model did not return a valid result.")
-            st.markdown("**Debug details**")
-            st.code(error)
-            st.caption(
-                "No prediction has been fabricated. Check that the saved Spark "
-                "PipelineModel is readable and that local Spark can start."
-            )
+            st.error("Prediction could not be completed.")
+            with st.expander("Technical details"):
+                st.code(error)
         else:
-            probability = float(prediction["fraud_probability"])
-            model_class = int(prediction.get("model_prediction", 0))
-            diagnostics = prediction.get("balance_diagnostics", {})
-            sender_mismatch = bool(diagnostics.get("sender_balance_mismatch", False))
-            receiver_mismatch = bool(diagnostics.get("receiver_balance_mismatch", False))
-            balance_mismatch = bool(
-                diagnostics.get(
-                    "any_balance_mismatch",
-                    sender_mismatch or receiver_mismatch,
-                )
+            probability = float(output["fraud_probability"])
+            model_class = int(output.get("model_prediction", 0))
+            diagnostics = output.get("balance_diagnostics", {})
+            sender_bad = bool(diagnostics.get("sender_balance_mismatch", False))
+            receiver_bad = bool(diagnostics.get("receiver_balance_mismatch", False))
+            any_bad = bool(diagnostics.get("any_balance_mismatch", sender_bad or receiver_bad))
+            threshold = threshold_pct / 100
+            threshold_hit = probability >= threshold
+            model_hit = model_class == 1
+            review = model_hit or threshold_hit or any_bad
+
+            if (model_hit or threshold_hit) and any_bad:
+                level, status, advice = "HIGH", "Model / threshold alert + balance mismatch", "Prioritise this transaction for human investigation."
+            elif model_hit:
+                level, status, advice = "HIGH", "Classifier flagged this transaction", "Investigate the model alert."
+            elif threshold_hit:
+                level, status, advice = "HIGH", "Probability threshold exceeded", "The estimated probability meets your review threshold."
+            elif any_bad:
+                level, status, advice = "REVIEW", "Balance inconsistency detected", "Check the balance movement even though the model did not flag it."
+            else:
+                level, status, advice = "LOW", "No configured alert triggered", "No current alert was triggered; this does not guarantee legitimacy."
+
+            st.markdown("---")
+            st.markdown("### Assessment result")
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Combined risk", level)
+            r2.metric("Fraud probability", f"{probability:.2%}")
+            r3.metric("Human review", "RECOMMENDED" if review else "NOT TRIGGERED")
+
+            css_class = "risk-high" if level == "HIGH" else "risk-review" if level == "REVIEW" else "risk-low"
+            st.markdown(f'<div class="{css_class}">{level} RISK · {advice}</div>', unsafe_allow_html=True)
+            st.write(f"**Signal:** {status}")
+            st.progress(min(max(probability, 0.0), 1.0), text="Model-estimated fraud probability")
+            st.caption(f"Selected threshold: {threshold:.0%} · Classifier output: {'Flagged (1)' if model_hit else 'Not flagged (0)'}")
+
+            st.markdown("### Balance diagnostics")
+            b1, b2 = st.columns(2)
+            with b1:
+                st.metric("Sender balance difference", money(diagnostics.get("sender_balance_difference", 0)))
+                st.caption("Mismatch: " + ("Detected" if sender_bad else "Not detected"))
+            with b2:
+                st.metric("Receiver balance difference", money(diagnostics.get("receiver_balance_difference", 0)))
+                st.caption("Mismatch: " + ("Detected" if receiver_bad else "Not detected"))
+
+            st.markdown("### Submitted transaction")
+            features = pd.DataFrame([{"Feature": k, "Value": str(v)} for k, v in tx.items()])
+            st.dataframe(features, hide_index=True, use_container_width=True)
+
+            report = {
+                "transaction": tx,
+                "model_prediction": model_class,
+                "fraud_probability": probability,
+                "review_threshold": threshold,
+                "risk_level": level,
+                "risk_status": status,
+                "human_review_recommended": review,
+                "recommendation": advice,
+                "balance_diagnostics": diagnostics,
+            }
+            st.download_button(
+                "Download assessment (JSON)",
+                data=json.dumps(report, indent=2).encode("utf-8"),
+                file_name="payshield_assessment.json",
+                mime="application/json",
             )
+            st.caption("This is a decision-support demonstration. A risk score or balance mismatch is not a definitive fraud determination.")
 
-            if not 0.0 <= probability <= 1.0:
-                st.error(f"Model returned invalid probability: {probability}")
-            else:
-                threshold = threshold_pct / 100.0
-                threshold_flag = probability >= threshold
-                model_flag = model_class == 1
-                requires_review = model_flag or threshold_flag or balance_mismatch
-
-                if (model_flag or threshold_flag) and balance_mismatch:
-                    risk_level = "HIGH"
-                    risk_status = "MODEL_ALERT_AND_BALANCE_MISMATCH"
-                    recommendation = "Prioritize this transaction for human review."
-                elif model_flag:
-                    risk_level = "HIGH"
-                    risk_status = "ML_FRAUD_ALERT"
-                    recommendation = "The classifier flagged this transaction; investigate it."
-                elif threshold_flag:
-                    risk_level = "HIGH"
-                    risk_status = "PROBABILITY_THRESHOLD_EXCEEDED"
-                    recommendation = "Fraud probability meets the selected review threshold."
-                elif balance_mismatch:
-                    risk_level = "REVIEW"
-                    risk_status = "BALANCE_MISMATCH"
-                    recommendation = (
-                        "Investigate the balance inconsistency even though the model "
-                        "did not flag fraud."
-                    )
-                else:
-                    risk_level = "LOW"
-                    risk_status = "NO_RULE_ALERT"
-                    recommendation = (
-                        "No configured alert was triggered. This does not guarantee "
-                        "that the transaction is legitimate."
-                    )
-
-                st.subheader("Risk assessment")
-                risk_col, status_col, review_col = st.columns(3)
-                risk_col.metric("Combined risk level", risk_level)
-                status_col.metric("Risk status", risk_status.replace("_", " ").title())
-                review_col.metric("Human review required", "YES" if requires_review else "NO")
-                if risk_level == "HIGH":
-                    st.error(f"HIGH RISK — {recommendation}")
-                elif risk_level == "REVIEW":
-                    st.warning(f"REVIEW REQUIRED — {recommendation}")
-                else:
-                    st.success(f"LOW ALERT LEVEL — {recommendation}")
-
-                st.subheader("Model output")
-                a, b, c = st.columns(3)
-                a.metric("Fraud probability", f"{probability:.2%}")
-                b.metric("Selected review threshold", f"{threshold:.0%}")
-                c.metric(
-                    "Threshold decision",
-                    "Flag for review" if threshold_flag else "Below threshold",
-                )
-                st.progress(probability, text="Model-estimated fraud probability")
-                st.write(
-                    f"**Random Forest class:** "
-                    f"{'Fraud-like (1)' if model_flag else 'Not flagged (0)'}"
-                )
-                st.caption(
-                    "The classifier's class, probability-threshold rule, and balance "
-                    "checks are separate signals. A review alert is not proof of fraud."
-                )
-
-                st.subheader("Balance consistency checks")
-                if balance_mismatch:
-                    st.warning(
-                        "At least one balance mismatch was detected. Review the "
-                        "transaction; the mismatch alone does not establish fraud."
-                    )
-                else:
-                    st.success("No balance mismatch detected by these checks.")
-
-                d1, d2 = st.columns(2)
-                with d1:
-                    st.metric(
-                        "Sender balance difference",
-                        f"{float(diagnostics.get('sender_balance_difference', 0)):,.2f}",
-                        help="Old sender balance minus amount minus new sender balance. A non-zero value indicates an inconsistency.",
-                    )
-                    st.caption(f"Mismatch detected: {'Yes' if sender_mismatch else 'No'}")
-                with d2:
-                    st.metric(
-                        "Receiver balance difference",
-                        f"{float(diagnostics.get('receiver_balance_difference', 0)):,.2f}",
-                        help="Old receiver balance plus amount minus new receiver balance. A non-zero value indicates an inconsistency.",
-                    )
-                    st.caption(f"Mismatch detected: {'Yes' if receiver_mismatch else 'No'}")
-
-                st.subheader("Submitted transaction")
-                feature_df = pd.DataFrame(
-                    [{
-                        "Feature": name,
-                        "Value": str(value),
-                    } for name, value in tx.items()]
-                )
-                st.dataframe(feature_df, hide_index=True, width="stretch")
-
-                st.download_button(
-                    "Download prediction report (JSON)",
-                    data=json.dumps({
-                        "transaction": tx,
-                        "model_prediction": model_class,
-                        "fraud_probability": probability,
-                        "threshold": threshold,
-                        "risk_assessment": {
-                            "risk_level": risk_level,
-                            "risk_status": risk_status,
-                            "requires_review": requires_review,
-                            "recommendation": recommendation,
-                        },
-                        "balance_diagnostics": diagnostics,
-                    }, indent=2).encode("utf-8"),
-                    file_name="payshield_prediction_report.json",
-                    mime="application/json",
-                )
-
-    st.divider()
-    st.subheader("Offline model evaluation")
-    metrics = load_metrics()
-    if metrics:
-        a, b, c = st.columns(3)
-        a.metric("ROC-AUC", f"{float(metrics.get('area_under_roc', 0)):.4f}")
-        b.metric("PR-AUC", f"{float(metrics.get('area_under_pr', 0)):.4f}")
-        c.metric(
-            "Test records",
-            f"{int(metrics.get('test_records', 0)):,}",
-        )
-        st.caption("These are saved test-set metrics, separate from the individual prediction above.")
-
-        threshold_rows = metrics.get("threshold_analysis", [])
-        if threshold_rows:
-            threshold_df = pd.DataFrame(threshold_rows)
-            needed = {"threshold", "precision", "recall", "f1"}
-            if needed.issubset(threshold_df.columns):
-                st.subheader("Threshold comparison (exploratory)")
-                st.warning(
-                    "These threshold values were calculated on the test set. "
-                    "For final reporting, choose a threshold using validation data "
-                    "and evaluate once on an untouched test set."
-                )
-                chart_df = threshold_df.melt(
-                    id_vars="threshold",
-                    value_vars=["precision", "recall", "f1"],
-                    var_name="Metric",
-                    value_name="Score (%)",
-                )
-                chart = alt.Chart(chart_df).mark_line(point=True).encode(
-                    x=alt.X("threshold:Q", title="Threshold", axis=alt.Axis(format="%")),
-                    y=alt.Y("Score (%):Q", title="Score (%)", scale=alt.Scale(domain=[0, 100])),
-                    color=alt.Color("Metric:N", title="Metric"),
-                    tooltip=[
-                        alt.Tooltip("threshold:Q", format=".0%"),
-                        "Metric:N",
-                        alt.Tooltip("Score (%):Q", format=".2f"),
-                    ],
-                ).properties(height=300)
-                st.altair_chart(chart, width="stretch")
+# ---------------------------- Transaction Explorer ----------------------------
+elif page == "Transaction Explorer":
+    st.markdown('<div class="section-label">DATA EXPLORATION</div>', unsafe_allow_html=True)
+    st.title("Transaction explorer")
+    st.write("Explore a bounded sample of the original PaySim data. Filters apply only to the loaded sample.")
+    if not RAW_DATA_PATH.exists():
+        st.warning("The raw PaySim CSV is not present in this deployment. Model inference can still work without it.")
     else:
-        st.caption("No metrics.json found; individual prediction can still work if the saved model exists.")
-
-
-# ============================================================
-# RUN HISTORY
-# ============================================================
-elif page == "Run History":
-    st.title("Pipeline Run History")
-    if not HISTORY_PATH.exists():
-        st.info("No dashboard-initiated pipeline runs have been recorded yet.")
-    else:
+        sample_size = st.selectbox("Rows to load", [5000, 10000, 30000, 50000], index=2)
         try:
-            history = pd.read_csv(HISTORY_PATH)
-            if history.empty:
-                st.info("Run history is empty.")
+            data = load_sample(sample_size)
+            if data.empty:
+                st.warning("No transaction rows were loaded.")
             else:
                 a, b, c = st.columns(3)
-                a.metric("Total runs", f"{len(history):,}")
-                b.metric("Successful", f"{int((history['status'] == 'SUCCESS').sum()):,}")
-                c.metric("Other outcomes", f"{int((history['status'] != 'SUCCESS').sum()):,}")
-                st.dataframe(history.iloc[::-1], hide_index=True, width="stretch")
+                a.metric("Loaded sample", f"{len(data):,}")
+                b.metric("Columns", f"{len(data.columns)}")
+                fraud_count = int(data["isFraud"].sum()) if "isFraud" in data else 0
+                c.metric("Fraud-labelled in sample", f"{fraud_count:,}")
+
+                x, y = st.columns(2)
+                if "type" in data:
+                    options = sorted(data["type"].dropna().unique().tolist())
+                    chosen = x.multiselect("Transaction types", options, default=options)
+                    data = data[data["type"].isin(chosen)]
+                if "isFraud" in data:
+                    label = y.selectbox("Label filter", ["All records", "Fraud-labelled", "Non-fraud"])
+                    if label == "Fraud-labelled":
+                        data = data[data["isFraud"] == 1]
+                    elif label == "Non-fraud":
+                        data = data[data["isFraud"] == 0]
+
+                st.metric("Rows after filters", f"{len(data):,}")
+                st.dataframe(data.head(500), use_container_width=True, hide_index=True)
                 st.download_button(
-                    "Download run history",
-                    data=history.to_csv(index=False).encode("utf-8"),
-                    file_name="payshield_run_history.csv",
+                    "Download filtered sample",
+                    data=data.to_csv(index=False).encode("utf-8"),
+                    file_name="payshield_transaction_sample.csv",
                     mime="text/csv",
                 )
         except Exception as exc:
-            st.error(f"Could not read run history: {exc}")
+            st.error(f"Could not read the sample: {exc}")
 
-    st.subheader("Pipeline logs")
-    logs = sorted(LOG_PATH.glob("pipeline_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if logs:
-        selected_log = st.selectbox("Choose log", logs, format_func=lambda p: p.name)
-        if selected_log:
-            st.code(selected_log.read_text(encoding="utf-8", errors="replace")[-12000:])
+# ---------------------------- Model Insights ----------------------------
+elif page == "Model Insights":
+    st.markdown('<div class="section-label">MODEL PERFORMANCE</div>', unsafe_allow_html=True)
+    st.title("Model insights")
+    st.write("Saved evaluation metrics from the model training run. These values are not recalculated by the dashboard.")
+    metrics = load_metrics()
+    if not metrics:
+        st.warning("No metrics.json file was found. The prediction page may still work if the saved model exists.")
     else:
-        st.caption("No pipeline logs found.")
+        a, b, c = st.columns(3)
+        if "area_under_roc" in metrics:
+            a.metric("ROC-AUC", f"{float(metrics['area_under_roc']):.4f}")
+        if "area_under_pr" in metrics:
+            b.metric("PR-AUC", f"{float(metrics['area_under_pr']):.4f}")
+        if "test_records" in metrics:
+            c.metric("Test records", f"{int(metrics['test_records']):,}")
 
+        rows = metrics.get("threshold_analysis", [])
+        if rows:
+            df = pd.DataFrame(rows)
+            st.markdown("### Threshold comparison")
+            available = [x for x in ["threshold", "precision", "recall", "f1"] if x in df.columns]
+            if available:
+                st.dataframe(df[available], hide_index=True, use_container_width=True)
+                st.caption("Use validation data to select a threshold; reserve the test set for final evaluation.")
+        with st.expander("View saved metrics JSON"):
+            st.json(metrics)
 
-
-# ============================================================
-# FOOTER
-# ============================================================
+# ---------------------------- Footer ----------------------------
 st.divider()
-st.caption("PayShield · Apache Spark · PySpark · Spark MLlib · Streamlit | Portfolio demonstration")
-
+st.markdown(
+    '<div class="small-muted">PAYSHIELD · APACHE SPARK · PYSPARK · SPARK MLlib · STREAMLIT<br>Portfolio demonstration · Risk alerts support review and do not prove fraud.</div>',
+    unsafe_allow_html=True,
+)
